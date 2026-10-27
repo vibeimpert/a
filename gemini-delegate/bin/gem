@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# gem — delega trabajo a Gemini CLI (login con cuenta de Google, sin API key)
+# y devuelve a Claude solo una respuesta corta y acotada.
+#
+# Uso:  gem [opciones] "instrucción"
+#   -t TAREA   plantilla de prompts/TAREA.md (map, find, summarize, review, research, logs, draft)
+#   -f RUTA    adjunta un archivo como contexto (repetible; "-" = stdin)
+#   -d DIR     Gemini explora DIR con sus propias herramientas (solo lectura)
+#   -m MODELO  pro | flash | flash-lite | auto | nombre exacto   (por defecto: según tarea)
+#   -n N       límite de palabras de la respuesta (por defecto 250)
+#   -w         permite a Gemini editar archivos (auto_edit). Revisa con `git diff`.
+#   -o ARCHIVO guarda la respuesta completa en ARCHIVO y solo imprime la ruta
+#   --fresh    ignora la caché
+#   --stats    muestra tokens procesados por Gemini (= tokens que Claude no leyó)
+#
+# Variables: GEM_BIN, GEM_TIMEOUT (s), GEM_MAX_CHARS, GEM_CACHE_DIR, GEM_CACHE_TTL (s),
+#            GEM_FALLBACK (cadena de modelos si se agota la cuota), GEM_EXTRA_ARGS
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PROMPTS_DIR="${GEM_PROMPTS_DIR:-$SELF_DIR/../prompts}"
+GEM_BIN="${GEM_BIN:-gemini}"
+TIMEOUT="${GEM_TIMEOUT:-600}"
+MAX_CHARS="${GEM_MAX_CHARS:-6000}"
+CACHE_DIR="${GEM_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gem}"
+CACHE_TTL="${GEM_CACHE_TTL:-86400}"
+FALLBACK="${GEM_FALLBACK:-pro flash flash-lite}"
+
+task="" model="" words=250 dir="" write=0 out="" fresh=0
+files=()
+
+die() { echo "gem: $*" >&2; exit 2; }
+sha() { if command -v sha256sum >/dev/null; then sha256sum | cut -c1-32; else shasum -a 256 | cut -c1-32; fi; }
+
+show_stats() {
+  local log="$CACHE_DIR/usage.jsonl"
+  [[ -f $log ]] || { echo "Sin uso registrado todavía."; return; }
+  node -e '
+    const lines = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n").map(JSON.parse);
+    const day = new Date().toISOString().slice(0, 10);
+    const agg = (rows) => rows.reduce((a, r) => (a.calls++, a.cached += r.cache ? 1 : 0,
+      a.inTok += r.prompt || 0, a.outChars += r.out_chars || 0, a), { calls: 0, cached: 0, inTok: 0, outChars: 0 });
+    for (const [name, rows] of [["hoy", lines.filter(r => r.ts.startsWith(day))], ["total", lines]]) {
+      const a = agg(rows);
+      const back = Math.round(a.outChars / 4);
+      console.log(`${name.padEnd(6)} llamadas=${a.calls} (caché=${a.cached})  tokens leídos por Gemini=${a.inTok}  ` +
+        `devueltos a Claude≈${back}  ahorro≈${a.inTok - back}`);
+    }' "$log"
+}
+
+while (($#)); do
+  case "$1" in
+    -t) task="$2"; shift 2 ;;
+    -f) files+=("$2"); shift 2 ;;
+    -d) dir="$2"; shift 2 ;;
+    -m) model="$2"; shift 2 ;;
+    -n) words="$2"; shift 2 ;;
+    -w) write=1; shift ;;
+    -o) out="$2"; shift 2 ;;
+    --fresh) fresh=1; shift ;;
+    --stats) show_stats; exit 0 ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; break ;;
+    -*) die "opción desconocida: $1" ;;
+    *) break ;;
+  esac
+done
+instruction="$*"
+[[ -n $instruction ]] || die "falta la instrucción (gem -h para ayuda)"
+command -v "$GEM_BIN" >/dev/null || die "no encuentro '$GEM_BIN'. Instala: npm i -g @google/gemini-cli && gemini (login con Google)"
+
+# Modelo por defecto según el tipo de trabajo: lo mecánico va a flash, el razonamiento a pro.
+if [[ -z $model ]]; then
+  case "$task" in
+    summarize|logs|find) model=flash ;;
+    *) model=pro ;;
+  esac
+fi
+
+# --- Prompt: plantilla + instrucción + contrato de salida -------------------
+template=""
+if [[ -n $task ]]; then
+  [[ -f $PROMPTS_DIR/$task.md ]] || die "no existe la plantilla '$task' en $PROMPTS_DIR"
+  template="$(<"$PROMPTS_DIR/$task.md")"
+fi
+contract="$(<"$PROMPTS_DIR/_contract.md")"
+prompt="${template}
+
+INSTRUCCIÓN:
+${instruction}
+
+${contract//\{\{WORDS\}\}/$words}"
+
+# --- Contexto adjunto (stdin de gemini) ---------------------------------------
+ctx_file="$(mktemp)"; trap 'rm -f "$ctx_file"' EXIT
+for f in "${files[@]}"; do
+  if [[ $f == - ]]; then
+    printf '===== STDIN =====\n' >>"$ctx_file"; cat >>"$ctx_file"
+  else
+    [[ -r $f ]] || die "no puedo leer $f"
+    printf '===== ARCHIVO: %s =====\n' "$f" >>"$ctx_file"
+    # Numera líneas para que Gemini pueda citar archivo:línea.
+    awk '{printf "%5d| %s\n", NR, $0}' "$f" >>"$ctx_file"
+  fi
+  printf '\n' >>"$ctx_file"
+done
+
+# --- Caché: misma pregunta + mismo contenido = 0 peticiones -------------------
+mkdir -p "$CACHE_DIR"
+dir_state=""
+if [[ -n $dir ]]; then
+  [[ -d $dir ]] || die "no existe el directorio $dir"
+  dir="$(cd "$dir" && pwd)"
+  dir_state="$dir $(git -C "$dir" rev-parse HEAD 2>/dev/null || true) $(git -C "$dir" status --porcelain 2>/dev/null | sha || true)"
+fi
+key="$( { printf '%s\n' "$model" "$write" "$dir_state" "$prompt"; cat "$ctx_file"; } | sha )"
+cache_file="$CACHE_DIR/$key.txt"
+
+log_usage() { # $1=modelo $2=tokens_prompt $3=caracteres_salida $4=cache(0/1)
+  printf '{"ts":"%s","task":"%s","model":"%s","prompt":%s,"out_chars":%s,"cache":%s}\n' \
+    "$(date -u +%FT%TZ)" "${task:-free}" "$1" "${2:-0}" "$3" "$( (($4)) && echo true || echo false)" \
+    >>"$CACHE_DIR/usage.jsonl"
+}
+
+emit() { # imprime la respuesta respetando el tope de caracteres para no inflar el contexto de Claude
+  local text="$1"
+  if [[ -n $out ]]; then
+    printf '%s\n' "$text" >"$out"
+    echo "[gem] respuesta completa en $out ($(wc -c <"$out") bytes)"
+  elif ((${#text} > MAX_CHARS)); then
+    local full="$CACHE_DIR/$key.full.txt"
+    printf '%s\n' "$text" >"$full"
+    printf '%s\n\n[gem] truncado a %s caracteres; completo en %s\n' "${text:0:MAX_CHARS}" "$MAX_CHARS" "$full"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+
+if ((!fresh && !write)) && [[ -f $cache_file ]] &&
+   (( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file") < CACHE_TTL )); then
+  text="$(<"$cache_file")"
+  log_usage "$model" 0 "${#text}" 1
+  emit "$text"
+  exit 0
+fi
+
+# --- Ejecución con fallback de modelo si se agota la cuota --------------------
+args=(-o json)
+((write)) && args+=(--approval-mode auto_edit)
+# shellcheck disable=SC2206
+[[ -n ${GEM_EXTRA_ARGS:-} ]] && args+=($GEM_EXTRA_ARGS)
+
+# Si se agota la cuota, baja por GEM_FALLBACK a partir del modelo pedido (nunca sube).
+chain=("$model") seen=0
+[[ " $FALLBACK " == *" $model "* ]] || seen=1
+for m in $FALLBACK; do
+  ((seen)) && [[ $m != "$model" ]] && chain+=("$m")
+  [[ $m == "$model" ]] && seen=1
+done
+
+last_err=""
+for m in "${chain[@]}"; do
+  raw="$(cd "${dir:-.}" && timeout "$TIMEOUT" "$GEM_BIN" -m "$m" -p "$prompt" "${args[@]}" <"$ctx_file" 2>&1)" || true
+  parsed="$(node -e '
+    let s = require("fs").readFileSync(0, "utf8");
+    const i = s.indexOf("{"); let j;
+    try { j = JSON.parse(s.slice(i)); } catch {
+      console.log(JSON.stringify({err: s.trim().slice(-800) || "gemini no devolvió salida"})); process.exit();
+    }
+    const tok = Object.values(j.stats?.models || {}).reduce((a, m) => a + (m.tokens?.prompt || 0), 0);
+    const err = j.error ? (j.error.message || JSON.stringify(j.error)) : (j.response ? "" : "respuesta vacía");
+    console.log(JSON.stringify({text: j.response || "", tok, err}));' <<<"$raw")"
+  err="$(node -pe 'JSON.parse(process.argv[1]).err || ""' "$parsed")"
+  if [[ -z $err ]]; then
+    text="$(node -pe 'JSON.parse(process.argv[1]).text' "$parsed")"
+    tok="$(node -pe 'JSON.parse(process.argv[1]).tok' "$parsed")"
+    ((write)) || printf '%s' "$text" >"$cache_file"
+    log_usage "$m" "$tok" "${#text}" 0
+    [[ $m != "$model" ]] && echo "[gem] cuota agotada en '$model'; respondió '$m'" >&2
+    emit "$text"
+    exit 0
+  fi
+  last_err="$err"
+  # Solo reintentamos con otro modelo si el error es de cuota/limite; el resto se reporta tal cual.
+  grep -qiE '429|quota|RESOURCE_EXHAUSTED|rate.?limit|capacity' <<<"$err" || break
+done
+
+echo "gem: Gemini falló: $last_err" >&2
+echo "gem: (si es de autenticación, ejecuta 'gemini' una vez y elige 'Login with Google')" >&2
+exit 1
