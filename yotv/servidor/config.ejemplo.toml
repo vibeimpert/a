@@ -1,0 +1,40 @@
+# Copia este archivo como config.toml y ajústalo.
+
+[servidor]
+puerto = 8765
+carpeta = "./datos"            # aquí se guardan los videos y la base de datos
+
+[espacio]
+max_gb = 20                    # tope de espacio para videos (en la PS4 puedes subirlo a 200+)
+videos_listos = 12             # cuántos videos sin ver tener siempre listos
+borrar_vistos_tras_horas = 2   # al terminar un video se borra pasado este tiempo
+borrar_sin_ver_tras_dias = 7   # lo que no veas en una semana se borra solo
+
+[youtube]
+# Cookies de tu cuenta de YouTube (ver LEEME.md). Sin esto solo funcionan "canales" y búsquedas.
+cookies = "./cookies.txt"
+fuentes = ["recomendados", "suscripciones"]   # también: "historial"
+canales = [
+  # "https://www.youtube.com/@NASA",
+]
+busquedas = [                  # búsquedas fijas que siempre se revisan (sirven aunque no tengas cookies)
+  # "documental espacio",
+]
+por_fuente = 40                # cuántos videos leer de cada feed por ciclo
+calidad_max = 1080             # 720 baja más rápido y ocupa la mitad
+marcar_visto = "al_ver"        # al_ver: avisa a YouTube cuando terminas un video (afina tus recomendaciones)
+                               # al_bajar: avisa apenas se baja · nunca: no toca tu historial
+duracion_min_seg = 120         # descarta shorts y clips
+duracion_max_seg = 5400        # descarta directos y videos de más de 1h30
+cada_minutos = 60              # cada cuánto revisa si hay que bajar más
+
+[claude]
+activado = true                # si no hay API key usa reglas simples automáticamente
+modelo = "claude-opus-5-5"     # "claude-haiku-5-5" cuesta ~40 veces menos y alcanza para elegir videos
+esfuerzo = "low"
+# api_key = "sk-ant-..."       # o pon la variable de entorno ANTHROPIC_API_KEY
+gustos = """
+Ciencia, espacio, tecnología, documentales, cocina.
+No me interesan los videos de chismes ni las reacciones.
+"""
+busquedas_extra = 3            # búsquedas propias de Claude para descubrir cosas nuevas

@@ -1,0 +1,13 @@
+# servidor
+servidor/datos/
+servidor/config.toml
+servidor/cookies.txt
+servidor/.env
+servidor/.venv/
+__pycache__/
+.pytest_cache/
+# app
+tele-app/.gradle/
+tele-app/build/
+tele-app/app/build/
+tele-app/local.properties

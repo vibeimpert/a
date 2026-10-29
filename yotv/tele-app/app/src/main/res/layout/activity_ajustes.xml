@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="48dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Ajustes de YoTV"
+        android:textColor="@color/texto"
+        android:textSize="28sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="Dirección del servidor (la tele con Termux: http://127.0.0.1:8765 · la PS4 o tu compu: http://IP-DE-ESE-EQUIPO:8765)"
+        android:textColor="@color/texto_suave"
+        android:textSize="16sp" />
+
+    <EditText
+        android:id="@+id/servidor"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:hint="http://192.168.1.50:8765"
+        android:importantForAutofill="no"
+        android:inputType="textUri"
+        android:singleLine="true"
+        android:textColor="@color/texto"
+        android:textSize="22sp" />
+
+    <Button
+        android:id="@+id/guardar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Probar y guardar" />
+
+    <TextView
+        android:id="@+id/resultado"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:textColor="@color/texto"
+        android:textSize="18sp" />
+</LinearLayout>
