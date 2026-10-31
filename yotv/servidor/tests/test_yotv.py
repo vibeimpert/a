@@ -11,6 +11,7 @@ from yotv import config, curador
 from yotv.biblioteca import Biblioteca
 from yotv.motor import Motor
 from yotv.servidor import crear_servidor
+from yotv.youtube import Cancelada, Descarga, Pista
 
 
 def candidato(i, canal="Canal A", dur=600, fuente="recomendados"):
@@ -32,14 +33,15 @@ class YouTubeFalso:
         self.consultas.append(q)
         return list(self.busquedas.get(q, []))
 
-    def bajar(self, cfg, vid, al_progresar=None):
+    def bajar(self, cfg, vid, descarga):
         cfg.carpeta_videos.mkdir(parents=True, exist_ok=True)
-        video = cfg.carpeta_videos / f"{vid}.mp4"
+        video = cfg.carpeta_videos / f"{vid}.video.mp4"
         video.write_bytes(b"x" * 1000)
+        descarga.pistas["video"] = Pista(video, total=1000, bajado=1000, terminado=True)
         mini = cfg.carpeta_videos / f"{vid}.jpg"
         mini.write_bytes(b"jpg")
+        descarga.miniatura = mini
         self.bajados.append(vid)
-        return video, mini
 
     def marcar_visto(self, cfg, vid):
         self.marcados.append(vid)
@@ -220,7 +222,7 @@ def test_busquedas_fijas_de_la_config(cfg):
 
 def test_descarga_fallida_se_reintenta_tres_veces(cfg):
     class Falla(YouTubeFalso):
-        def bajar(self, cfg, vid, al_progresar=None):
+        def bajar(self, cfg, vid, descarga):
             self.bajados.append(vid)
             raise RuntimeError("Sign in to confirm you're not a bot")
     yt = Falla([candidato(1)])
@@ -232,3 +234,122 @@ def test_descarga_fallida_se_reintenta_tres_veces(cfg):
     v = m.bib.obtener("vid00000001")
     assert v["estado"] == "fallido" and v["intentos"] == 3
     assert yt.bajados == ["vid00000001"] * 3
+
+
+def test_pista_adelantada():
+    # 600 s de video, 60 MB: la reproducción consume 100 KB/s.
+    total, dur = 60_000_000, 600
+    assert not Pista(Path("x"), total=total, bajado=5_000_000, velocidad=None).adelantada(dur)
+    # Baja al doble de lo que se reproduce: basta el margen de 20 s (2 MB).
+    assert not Pista(Path("x"), total=total, bajado=1_000_000, velocidad=200_000).adelantada(dur)
+    assert Pista(Path("x"), total=total, bajado=2_100_000, velocidad=200_000).adelantada(dur)
+    # Baja a la mitad: hay que tener ya la mitad más el margen.
+    assert not Pista(Path("x"), total=total, bajado=25_000_000, velocidad=50_000).adelantada(dur)
+    assert Pista(Path("x"), total=total, bajado=32_100_000, velocidad=50_000).adelantada(dur)
+    # Sin tamaño final o sin duración no se arriesga.
+    assert not Pista(Path("x"), total=None, bajado=10**9, velocidad=10**9).adelantada(dur)
+    assert Pista(Path("x"), terminado=True).adelantada(None)
+
+
+class YouTubeLento(YouTubeFalso):
+    """Baja video y audio por pasos; el test decide cuándo avanza."""
+
+    def __init__(self, feed):
+        super().__init__(feed)
+        self.avanzar = threading.Event()
+        self.empezo = threading.Event()
+
+    def bajar(self, cfg, vid, descarga):
+        cfg.carpeta_videos.mkdir(parents=True, exist_ok=True)
+        v = cfg.carpeta_videos / f"{vid}.video.mp4"
+        a = cfg.carpeta_videos / f"{vid}.audio.m4a"
+        a.write_bytes(b"a" * 100)
+        v.write_bytes(b"v" * 400)
+        descarga.pistas["video"] = Pista(v, total=1000, bajado=400, velocidad=10**9)
+        descarga.pistas["audio"] = Pista(a, total=100, bajado=100, terminado=True)
+        self.empezo.set()
+        self.avanzar.wait(10)
+        if descarga.cancelada:
+            raise Cancelada()
+        with open(v, "ab") as f:
+            f.write(b"w" * 600)
+        descarga.pistas["video"].bajado = 1000
+        descarga.pistas["video"].terminado = True
+        self.bajados.append(vid)
+
+
+def servir(m):
+    srv = crear_servidor(m, host="127.0.0.1", puerto=0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def test_se_ve_mientras_se_baja(cfg):
+    cfg.videos_listos = 1
+    yt = YouTubeLento([candidato(1)])
+    m = nuevo_motor(cfg, yt)
+    hilo = threading.Thread(target=m.ciclo, daemon=True)
+    hilo.start()
+    assert yt.empezo.wait(5)
+    srv, base = servir(m)
+    try:
+        videos = json.load(urllib.request.urlopen(base + "/api/videos"))["videos"]
+        assert len(videos) == 1
+        v = videos[0]
+        assert v["bajando"] == 45 and v["audio"].endswith("/audio")
+
+        # La tele pide el video entero: recibe lo bajado y espera el resto sin cortarse.
+        recibido = {}
+
+        def leer():
+            with urllib.request.urlopen(base + v["media"]) as r:
+                recibido["largo"] = r.headers["Content-Length"]
+                recibido["datos"] = r.read()
+
+        lector = threading.Thread(target=leer)
+        lector.start()
+        time.sleep(0.6)
+        assert lector.is_alive()  # sigue esperando bytes nuevos
+        yt.avanzar.set()
+        lector.join(5)
+        assert recibido["largo"] == "1000"
+        assert recibido["datos"] == b"v" * 400 + b"w" * 600
+
+        assert urllib.request.urlopen(base + v["audio"]).read() == b"a" * 100
+        hilo.join(5)
+        final = m.bib.obtener("vid00000001")
+        assert final["estado"] == "listo" and final["audio"].endswith(".audio.m4a")
+        assert final["tamano"] == 1100
+        # Ya terminado, el audio se sirve desde el archivo guardado.
+        assert urllib.request.urlopen(base + v["audio"]).read() == b"a" * 100
+    finally:
+        yt.avanzar.set()
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_visto_durante_la_descarga_queda_visto(cfg):
+    cfg.videos_listos = 1
+    yt = YouTubeLento([candidato(1)])
+    m = nuevo_motor(cfg, yt)
+    hilo = threading.Thread(target=m.ciclo, daemon=True)
+    hilo.start()
+    assert yt.empezo.wait(5)
+    assert m.reportar_progreso("vid00000001", 590, 600)["estado"] == "visto"
+    yt.avanzar.set()
+    hilo.join(5)
+    assert m.bib.obtener("vid00000001")["estado"] == "visto"
+
+
+def test_no_me_gusta_cancela_la_descarga(cfg):
+    cfg.videos_listos = 1
+    yt = YouTubeLento([candidato(1)])
+    m = nuevo_motor(cfg, yt)
+    hilo = threading.Thread(target=m.ciclo, daemon=True)
+    hilo.start()
+    assert yt.empezo.wait(5)
+    m.opinar("vid00000001", "no_me_gusta")
+    yt.avanzar.set()
+    hilo.join(5)
+    assert m.bib.obtener("vid00000001")["estado"] == "borrado"
+    assert list(cfg.carpeta_videos.glob("vid00000001.*")) == []

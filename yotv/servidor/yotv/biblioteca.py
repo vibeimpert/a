@@ -3,7 +3,7 @@
 Estados:
   rechazado   Claude (o el filtro) lo vio y no lo eligió. Se guarda para no volver a evaluarlo.
   en_cola     elegido, esperando descarga
-  bajando     descargándose ahora
+  bajando     descargándose ahora (ya se puede ver si la descarga va adelantada)
   listo       descargado y sin ver
   visto       lo terminaste; se borra tras unas horas
   borrado     archivo eliminado
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS videos (
     motivo      TEXT,
     estado      TEXT NOT NULL,
     archivo     TEXT,
+    audio       TEXT,
     miniatura   TEXT,
     tamano      INTEGER DEFAULT 0,
     agregado    REAL,

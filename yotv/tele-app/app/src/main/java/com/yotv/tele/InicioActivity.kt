@@ -184,7 +184,12 @@ class InicioActivity : Activity() {
         }
         tarjeta.addView(marco)
         tarjeta.addView(texto(v.titulo, 15f, R.color.texto, 2).apply { setPadding(0, dp(6), 0, 0) })
-        tarjeta.addView(texto(if (v.visto) "Ya lo viste · ${v.canal}" else v.canal, 13f, R.color.texto_suave))
+        val linea = when {
+            v.visto -> "Ya lo viste · ${v.canal}"
+            v.bajando != null -> "Bajando ${v.bajando}% · ya puedes verlo"
+            else -> v.canal
+        }
+        tarjeta.addView(texto(linea, 13f, R.color.texto_suave))
         if (v.motivo.isNotEmpty()) tarjeta.addView(texto(v.motivo, 12f, R.color.texto_suave))
 
         alEnfocar(tarjeta)
@@ -204,6 +209,7 @@ class InicioActivity : Activity() {
             putExtra("ids", videos.map { it.id }.toTypedArray())
             putExtra("titulos", videos.map { it.titulo }.toTypedArray())
             putExtra("medias", videos.map { it.media }.toTypedArray())
+            putExtra("audios", videos.map { it.audio ?: "" }.toTypedArray())
             putExtra("posiciones", videos.map { it.posicion }.toIntArray())
             putExtra("duraciones", videos.map { it.duracion }.toIntArray())
             putExtra("indice", indice)

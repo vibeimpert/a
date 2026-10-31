@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
@@ -84,41 +86,118 @@ def buscar(cfg: Config, consulta: str, cuantos: int = 6) -> list[dict]:
     return _listar(cfg, f"ytsearch{cuantos}:{consulta}", "búsqueda", cuantos)
 
 
-def bajar(cfg: Config, vid: str, al_progresar=None) -> tuple[Path, Path | None]:
-    """Baja el video en MP4 (H.264, lo que cualquier tele decodifica por hardware).
+@dataclass
+class Pista:
+    """Un archivo que se está bajando (video o audio). El servidor lo lee mientras crece."""
+    ruta: Path
+    total: int | None = None  # tamaño final exacto; sin él no se puede ver hasta que termine
+    bajado: int = 0
+    velocidad: float | None = None  # bytes/s
+    terminado: bool = False
 
-    Devuelve (archivo de video, miniatura o None).
+    def adelantada(self, duracion: int | None, margen_seg: int = 20) -> bool:
+        """¿La descarga va a ir siempre por delante de lo que se reproduce, con margen?
+
+        Viendo desde el inicio, la reproducción avanza total/duracion bytes por segundo.
+        Si bajamos más rápido que eso, basta con tener el margen; si no, hay que esperar
+        a que lo ya bajado compense lo que falta.
+        """
+        if self.terminado:
+            return True
+        if not self.total or not duracion:
+            return False
+        margen = self.total * margen_seg / duracion
+        falta_cubrir = max(0.0, self.total - (self.velocidad or 0) * duracion)
+        return self.bajado >= min(falta_cubrir + margen, self.total)
+
+
+@dataclass
+class Descarga:
+    pistas: dict[str, Pista] = field(default_factory=dict)  # "video" y, si va aparte, "audio"
+    miniatura: Path | None = None
+    cancelada: bool = False
+
+    @property
+    def porcentaje(self) -> int | None:
+        total = sum(p.total or 0 for p in self.pistas.values())
+        if not total:
+            return None
+        return round(100 * sum(p.bajado for p in self.pistas.values()) / total)
+
+
+class Cancelada(Exception):
+    pass
+
+
+def bajar(cfg: Config, vid: str, descarga: Descarga) -> None:
+    """Baja video y audio por separado y en paralelo, en orden y sin unirlos al final.
+
+    YouTube los entrega como MP4 fragmentado: un archivo a medio bajar ya se puede reproducir
+    hasta donde llegó, así que la tele puede empezar a verlo mientras se sigue bajando.
+    Va llenando `descarga` a medida que avanza.
     """
     destino = cfg.carpeta_videos
     destino.mkdir(parents=True, exist_ok=True)
     h = cfg.calidad_max
     opts = _opciones_base(cfg) | {
-        "format": (
-            f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/"
-            f"b[height<={h}][ext=mp4]/bv*[height<={h}]+ba/b"
-        ),
-        "merge_output_format": "mp4",
-        "outtmpl": {"default": str(destino / "%(id)s.%(ext)s")},
-        "writethumbnail": True,
-        "postprocessors": [{"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"}],
-        "concurrent_fragment_downloads": 4,
+        # Video H.264 (lo decodifica cualquier tele) + audio M4A; si no existen por separado, uno combinado.
+        "format": f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/b",
+        "nopart": True,      # escribe directo al archivo final para poder leerlo mientras crece
+        "continuedl": False,
         "retries": 5,
         "noplaylist": True,
         "mark_watched": cfg.marcar_visto == "al_bajar",
     }
-    if al_progresar:
-        opts["progress_hooks"] = [al_progresar]
     with YoutubeDL(opts) as ydl:
-        ydl.extract_info(_url(vid), download=True)
+        info = ydl.extract_info(_url(vid), download=False)
+        try:
+            mini = destino / f"{vid}.jpg"
+            mini.write_bytes(ydl.urlopen(f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg").read())
+            descarga.miniatura = mini
+        except Exception as e:
+            log.debug("Sin miniatura para %s: %s", vid, e)
 
-    video = destino / f"{vid}.mp4"
-    if not video.exists():
-        otros = sorted(p for p in destino.glob(f"{vid}.*") if p.suffix not in (".jpg", ".part", ".ytdl"))
-        if not otros:
-            raise FileNotFoundError(f"yt-dlp terminó pero no encuentro el archivo de {vid}")
-        video = otros[0]
-    miniatura = destino / f"{vid}.jpg"
-    return video, (miniatura if miniatura.exists() else None)
+    formatos = info.get("requested_formats") or [info]
+    trabajos = []
+    for fmt in formatos:
+        nombre = "audio" if fmt.get("vcodec") == "none" and len(formatos) > 1 else "video"
+        pista = Pista(destino / f"{vid}.{nombre}.{fmt.get('ext') or 'mp4'}", total=fmt.get("filesize"))
+        descarga.pistas[nombre] = pista
+        datos = {k: v for k, v in info.items() if k != "requested_formats"} | fmt
+        trabajos.append((pista, datos))
+
+    abortar = threading.Event()  # si una pista falla, la otra se detiene
+
+    def una(pista: Pista, datos: dict, errores: list) -> None:
+        def progreso(d: dict) -> None:
+            if descarga.cancelada or abortar.is_set():
+                raise Cancelada()
+            pista.bajado = d.get("downloaded_bytes") or pista.bajado
+            pista.total = d.get("total_bytes") or pista.total
+            pista.velocidad = d.get("speed") or pista.velocidad
+
+        try:
+            with YoutubeDL(opts | {"progress_hooks": [progreso]}) as ydl:
+                if not ydl.dl(str(pista.ruta), datos):
+                    raise RuntimeError(f"No se pudo bajar el {pista.ruta.suffix}")
+            pista.bajado = pista.ruta.stat().st_size
+            pista.total = pista.bajado
+            pista.terminado = True
+        except Exception as e:
+            if not isinstance(e, Cancelada):
+                errores.append(e)
+                abortar.set()
+
+    errores: list = []
+    hilos = [threading.Thread(target=una, args=(p, d, errores), daemon=True) for p, d in trabajos]
+    for t in hilos:
+        t.start()
+    for t in hilos:
+        t.join()
+    if descarga.cancelada:
+        raise Cancelada()
+    if errores:
+        raise errores[0]
 
 
 def marcar_visto(cfg: Config, vid: str) -> None:

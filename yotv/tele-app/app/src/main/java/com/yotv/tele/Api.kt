@@ -14,6 +14,8 @@ data class Video(
     val motivo: String,
     val visto: Boolean,
     val media: String,
+    val audio: String?,       // YouTube entrega el audio aparte; null si va dentro del video
+    val bajando: Int?,        // % bajado si todavía se está descargando
     val miniatura: String?,
 )
 
@@ -54,6 +56,8 @@ class Api(base: String) {
                 motivo = v.optString("motivo", ""),
                 visto = v.optBoolean("visto", false),
                 media = v.getString("media"),
+                audio = if (v.isNull("audio")) null else v.getString("audio"),
+                bajando = if (v.isNull("bajando")) null else v.getInt("bajando"),
                 miniatura = if (v.isNull("miniatura")) null else v.getString("miniatura"),
             )
         }

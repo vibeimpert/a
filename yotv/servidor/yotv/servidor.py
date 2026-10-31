@@ -4,6 +4,8 @@ GET  /                         página de estado (ábrela desde el celular)
 GET  /api/videos               videos listos para ver
 GET  /api/estado               qué está haciendo el motor
 GET  /media/<id>               el video (con soporte de Range para adelantar/atrasar)
+GET  /media/<id>/audio         el audio, cuando YouTube lo entrega aparte
+                               (los dos se pueden pedir mientras todavía se bajan)
 GET  /miniatura/<id>           la miniatura
 POST /api/videos/<id>/progreso {"posicion": seg, "duracion": seg}
 POST /api/videos/<id>/opinion  {"opinion": "me_gusta" | "no_me_gusta"}
@@ -23,9 +25,17 @@ from .motor import Motor
 
 log = logging.getLogger(__name__)
 BLOQUE = 256 * 1024
+ESPERA_MAX = 60  # segundos esperando bytes nuevos de una descarga antes de cortar
+
+_TIPOS = {".mp4": "video/mp4", ".m4a": "audio/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska"}
 
 
-def _video_publico(v: dict) -> dict:
+def _tipo(ruta: Path) -> str:
+    return _TIPOS.get(ruta.suffix, "application/octet-stream")
+
+
+def _video_publico(v: dict, descarga=None) -> dict:
+    con_audio = bool(v.get("audio")) or bool(descarga and "audio" in descarga.pistas)
     return {
         "id": v["id"],
         "titulo": v["titulo"],
@@ -35,7 +45,9 @@ def _video_publico(v: dict) -> dict:
         "motivo": v["motivo"],
         "visto": v["estado"] == "visto",
         "media": f"/media/{v['id']}",
-        "miniatura": f"/miniatura/{v['id']}" if v["miniatura"] else None,
+        "audio": f"/media/{v['id']}/audio" if con_audio else None,
+        "bajando": descarga.porcentaje if descarga else None,
+        "miniatura": f"/miniatura/{v['id']}" if v["miniatura"] or (descarga and descarga.miniatura) else None,
     }
 
 
@@ -67,10 +79,13 @@ def crear_servidor(motor: Motor, host: str = "0.0.0.0", puerto: int | None = Non
             except json.JSONDecodeError:
                 return {}
 
-        def _archivo(self, ruta: Path, tipo: str) -> None:
+        def _archivo(self, ruta: Path, tipo: str, pista=None) -> None:
+            """Envía un archivo. Si `pista` sigue bajándose, anuncia el tamaño final y espera
+            los bytes que todavía no llegan, así la tele lo ve como una conexión lenta."""
             if not ruta.is_file():
                 return self._json({"error": "no existe"}, 404)
-            total = ruta.stat().st_size
+            creciendo = pista is not None and not pista.terminado and pista.total
+            total = pista.total if creciendo else ruta.stat().st_size
             inicio, fin, codigo = 0, total - 1, 200
             rango = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
             if rango and (rango[1] or rango[2]):
@@ -98,19 +113,30 @@ def crear_servidor(motor: Motor, host: str = "0.0.0.0", puerto: int | None = Non
             with open(ruta, "rb") as f:
                 f.seek(inicio)
                 restante = fin - inicio + 1
+                vacio_desde = None
                 try:
                     while restante > 0:
                         trozo = f.read(min(BLOQUE, restante))
-                        if not trozo:
+                        if trozo:
+                            self.wfile.write(trozo)
+                            restante -= len(trozo)
+                            vacio_desde = None
+                            continue
+                        # Llegamos a lo bajado: esperar más, salvo que ya no vaya a llegar nada.
+                        if not creciendo or (pista.terminado and vacio_desde is not None):
                             break
-                        self.wfile.write(trozo)
-                        restante -= len(trozo)
+                        vacio_desde = vacio_desde or time.monotonic()
+                        if time.monotonic() - vacio_desde > ESPERA_MAX:
+                            break
+                        time.sleep(0.25)
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # la tele cerró la conexión al adelantar: normal
 
         def _estado(self) -> dict:
+            actual = next(iter(motor.descargas.values()), None)
             return {
                 **motor.estado,
+                "progreso": actual.porcentaje if actual else None,
                 "listos": bib.contar("listo"),
                 "en_cola": bib.contar("en_cola", "bajando"),
                 "vistos": bib.contar("visto"),
@@ -126,21 +152,31 @@ def crear_servidor(motor: Motor, host: str = "0.0.0.0", puerto: int | None = Non
         def do_GET(self):
             ruta = self.path.split("?")[0]
             if ruta == "/api/videos":
-                videos = bib.por_estado("listo", "visto", orden="listo_en")
-                # Primero lo que dejaste a medias, luego lo nuevo, al final lo ya visto.
-                videos.sort(key=lambda v: (v["estado"] == "visto", not v["posicion"], v["listo_en"] or 0))
-                return self._json({"videos": [_video_publico(v) for v in videos]})
+                videos = [v for v in bib.por_estado("listo", "visto", "bajando", orden="listo_en")
+                          if motor.se_puede_ver(v)]
+                # Lo que dejaste a medias, lo listo, lo que se está bajando y al final lo ya visto.
+                videos.sort(key=lambda v: (v["estado"] == "visto", not v["posicion"],
+                                           v["estado"] == "bajando", v["listo_en"] or 0))
+                return self._json({"videos": [_video_publico(v, motor.descargas.get(v["id"])) for v in videos]})
             if ruta == "/api/estado":
                 return self._json(self._estado())
-            if m := re.fullmatch(r"/media/([\w-]{6,20})", ruta):
+            if m := re.fullmatch(r"/media/([\w-]{6,20})(/audio)?", ruta):
+                nombre = "audio" if m[2] else "video"
+                d = motor.descargas.get(m[1])
+                if d and nombre in d.pistas:
+                    pista = d.pistas[nombre]
+                    return self._archivo(pista.ruta, _tipo(pista.ruta), pista)
                 v = bib.obtener(m[1])
-                if v and v["archivo"]:
-                    return self._archivo(Path(v["archivo"]), "video/mp4")
+                archivo = v and v["audio" if m[2] else "archivo"]
+                if archivo:
+                    return self._archivo(Path(archivo), _tipo(Path(archivo)))
                 return self._json({"error": "no existe"}, 404)
             if m := re.fullmatch(r"/miniatura/([\w-]{6,20})", ruta):
+                d = motor.descargas.get(m[1])
                 v = bib.obtener(m[1])
-                if v and v["miniatura"]:
-                    return self._archivo(Path(v["miniatura"]), "image/jpeg")
+                mini = (d and d.miniatura) or (v and v["miniatura"])
+                if mini:
+                    return self._archivo(Path(mini), "image/jpeg")
                 return self._json({"error": "no existe"}, 404)
             if ruta == "/":
                 return self._pagina()

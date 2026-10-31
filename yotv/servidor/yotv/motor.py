@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 
 
 def _borrar_archivos(video: dict) -> None:
-    for campo in ("archivo", "miniatura"):
+    for campo in ("archivo", "audio", "miniatura"):
         if video.get(campo):
             Path(video[campo]).unlink(missing_ok=True)
 
@@ -29,7 +29,8 @@ class Motor:
         self._despertar = threading.Event()
         self._parar = threading.Event()
         self.estado = {"fase": "esperando", "ultimo_ciclo": None, "proximo_ciclo": None,
-                       "ultimo_error": None, "bajando": None, "progreso": None}
+                       "ultimo_error": None, "bajando": None}
+        self.descargas: dict[str, youtube.Descarga] = {}  # lo que se está bajando ahora
 
     # ---------- limpieza ----------
     def limpiar(self) -> int:
@@ -39,7 +40,7 @@ class Motor:
         def borrar(v: dict, estado: str = "borrado") -> None:
             nonlocal borrados
             _borrar_archivos(v)
-            self.bib.actualizar(v["id"], estado=estado, archivo=None, miniatura=None, tamano=0)
+            self.bib.actualizar(v["id"], estado=estado, archivo=None, audio=None, miniatura=None, tamano=0)
             borrados += 1
 
         limite_vistos = ahora - self.cfg.borrar_vistos_tras_horas * 3600
@@ -98,31 +99,55 @@ class Motor:
                 break
             self.bib.actualizar(v["id"], estado="bajando")
             self.estado["bajando"] = v["titulo"]
-
-            def progreso(d: dict) -> None:
-                total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                if d.get("status") == "downloading" and total:
-                    self.estado["progreso"] = round(100 * d.get("downloaded_bytes", 0) / total)
-
+            descarga = youtube.Descarga()
+            self.descargas[v["id"]] = descarga
             try:
-                archivo, miniatura = self.yt.bajar(self.cfg, v["id"], progreso)
+                self.yt.bajar(self.cfg, v["id"], descarga)
+                if descarga.cancelada:  # "no me gusta" justo cuando terminaba
+                    raise youtube.Cancelada()
+                video, audio = descarga.pistas["video"], descarga.pistas.get("audio")
+                # Si lo terminaste de ver mientras se bajaba, queda como visto.
+                ya_visto = self.bib.obtener(v["id"])["estado"] == "visto"
                 self.bib.actualizar(
-                    v["id"], estado="listo", archivo=str(archivo),
-                    miniatura=str(miniatura) if miniatura else None,
-                    tamano=archivo.stat().st_size, listo_en=time.time(), error=None,
+                    v["id"], estado="visto" if ya_visto else "listo", archivo=str(video.ruta),
+                    audio=str(audio.ruta) if audio else None,
+                    miniatura=str(descarga.miniatura) if descarga.miniatura else None,
+                    tamano=sum(p.ruta.stat().st_size for p in descarga.pistas.values()),
+                    listo_en=time.time(), error=None,
                 )
                 bajados += 1
                 log.info("Listo: %s", v["titulo"])
+            except youtube.Cancelada:
+                log.info("Cancelado: %s", v["titulo"])
+                self._borrar_parciales(descarga)
             except Exception as e:
+                self._borrar_parciales(descarga)
                 intentos = (v["intentos"] or 0) + 1
                 log.warning("Falló la descarga de %s (intento %d): %s", v["titulo"], intentos, e)
                 # Los errores pasajeros (red, "confirma que no eres un bot") se reintentan el próximo ciclo.
                 self.bib.actualizar(v["id"], estado="fallido" if intentos >= 3 else "en_cola",
                                     intentos=intentos, error=str(e)[:500])
             finally:
+                self.descargas.pop(v["id"], None)
                 self.estado["bajando"] = None
-                self.estado["progreso"] = None
         return bajados
+
+    @staticmethod
+    def _borrar_parciales(descarga: youtube.Descarga) -> None:
+        for p in descarga.pistas.values():
+            p.ruta.unlink(missing_ok=True)
+        if descarga.miniatura:
+            descarga.miniatura.unlink(missing_ok=True)
+
+    def se_puede_ver(self, v: dict) -> bool:
+        """Listo, o bajándose lo bastante rápido como para verlo sin alcanzar a la descarga."""
+        if v["estado"] in ("listo", "visto"):
+            return True
+        d = self.descargas.get(v["id"])
+        return bool(
+            v["estado"] == "bajando" and d and "video" in d.pistas
+            and all(p.adelantada(v["duracion"]) for p in d.pistas.values())
+        )
 
     # ---------- ciclo ----------
     def ciclo(self) -> dict:
@@ -166,14 +191,14 @@ class Motor:
     # ---------- lo que reporta la tele ----------
     def reportar_progreso(self, vid: str, posicion: int, duracion: int | None) -> dict | None:
         v = self.bib.obtener(vid)
-        if not v or v["estado"] not in ("listo", "visto"):
+        if not v or v["estado"] not in ("listo", "visto", "bajando"):
             return None
         cambios: dict = {"posicion": int(posicion), "abierto_en": time.time()}
         duracion = duracion or v["duracion"]
         if duracion and not v["duracion"]:
             cambios["duracion"] = int(duracion)
         termino = bool(duracion) and posicion >= 0.9 * duracion
-        if termino and v["estado"] == "listo":
+        if termino and v["estado"] in ("listo", "bajando"):
             cambios |= {"estado": "visto", "visto_en": time.time()}
             if self.cfg.marcar_visto == "al_ver":
                 threading.Thread(target=self.yt.marcar_visto, args=(self.cfg, vid), daemon=True).start()
@@ -185,9 +210,11 @@ class Motor:
         v = self.bib.obtener(vid)
         if not v or opinion not in ("me_gusta", "no_me_gusta"):
             return None
-        if opinion == "no_me_gusta" and v["estado"] in ("listo", "visto"):
+        if opinion == "no_me_gusta" and v["estado"] in ("listo", "visto", "bajando", "en_cola"):
+            if vid in self.descargas:
+                self.descargas[vid].cancelada = True  # la descarga se corta y borra lo parcial
             _borrar_archivos(v)
-            self.bib.actualizar(vid, opinion=opinion, estado="borrado", archivo=None,
+            self.bib.actualizar(vid, opinion=opinion, estado="borrado", archivo=None, audio=None,
                                 miniatura=None, tamano=0, abierto_en=time.time())
             self.despertar()
         else:

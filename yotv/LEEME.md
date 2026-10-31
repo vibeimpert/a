@@ -7,6 +7,7 @@ YoTV convierte tu tele (Google TV / Android TV, como tu TCL) en un canal hecho p
 - **Se ven sin anuncios ni buffering**, porque ya están guardados.
 - **Se borran solos** cuando los terminas (o si pasan días sin que los veas) y se bajan otros en su lugar.
 - **Le enseña a YouTube**: cuando terminas un video, YoTV lo marca como visto en tu cuenta, así tus recomendaciones mejoran con lo que de verdad ves.
+- **No esperas a que termine de bajar**: video y audio se bajan en paralelo y en orden. Un video aparece en la tele apenas la descarga va lo bastante rápida para ir siempre por delante de lo que estás viendo (con 20 s de margen). En la tarjeta dice "Bajando 35 % · ya puedes verlo".
 - La app puede ser **la pantalla de inicio** de la tele: tus videos, tus apps y los ajustes, sin publicidad.
 
 ```
@@ -160,8 +161,9 @@ Todo está explicado en [`servidor/config.ejemplo.toml`](servidor/config.ejemplo
 - **La app dice "Sin conexión con el servidor"**: revisa que el servidor esté corriendo y que la IP en *Ajustes de YoTV* sea la correcta.
 - **No baja nada**: mira `python -m yotv estado` o la página web del servidor. Los errores aparecen ahí.
 - **Se llena el disco**: baja `max_gb` o `videos_listos`.
+- **Se queda cargando al adelantar un video que se está bajando**: es normal si saltas más allá de lo ya bajado; espera unos segundos o vuelve atrás.
 
 ## Para desarrolladores
 
-- Servidor: `servidor/`, Python 3.11+ con solo `yt-dlp` y `anthropic`. Pruebas: `cd servidor && python -m pytest`.
+- Servidor: `servidor/`, Python 3.11+ con solo `yt-dlp` y `anthropic`. Pruebas: `cd servidor && python -m pytest`. Para entender el código por tu cuenta, lee [COMO-LEER-EL-CODIGO.md](COMO-LEER-EL-CODIGO.md).
 - App: `tele-app/`, Kotlin + Media3, sin otras dependencias. Compilar: `cd tele-app && ./gradlew assembleRelease`. La llave de firma (`app/yotv.keystore`) es fija a propósito para que las versiones nuevas se instalen encima; es solo para uso personal.

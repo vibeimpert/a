@@ -11,10 +11,15 @@ import androidx.annotation.OptIn
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
 
-/** Reproduce los videos guardados uno tras otro y le cuenta al servidor hasta dónde viste. */
+/** Reproduce los videos guardados uno tras otro y le cuenta al servidor hasta dónde viste.
+ *  Puede reproducir un video que todavía se está bajando: el servidor espera los bytes que faltan. */
+@OptIn(UnstableApi::class)
 class ReproductorActivity : Activity() {
     private lateinit var reproductor: ExoPlayer
     private lateinit var titulo: TextView
@@ -22,6 +27,8 @@ class ReproductorActivity : Activity() {
     private lateinit var ids: Array<String>
     private lateinit var titulos: Array<String>
     private lateinit var medias: Array<String>
+    private lateinit var audios: Array<String>
+    private lateinit var fuentes: ProgressiveMediaSource.Factory
     private lateinit var posiciones: IntArray
     private lateinit var duraciones: IntArray
     private var actual = 0
@@ -34,7 +41,6 @@ class ReproductorActivity : Activity() {
     }
     private val ocultarTitulo = Runnable { titulo.visibility = View.GONE }
 
-    @OptIn(UnstableApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_reproductor)
@@ -43,6 +49,10 @@ class ReproductorActivity : Activity() {
         ids = intent.getStringArrayExtra("ids") ?: emptyArray()
         titulos = intent.getStringArrayExtra("titulos") ?: emptyArray()
         medias = intent.getStringArrayExtra("medias") ?: emptyArray()
+        audios = intent.getStringArrayExtra("audios") ?: Array(medias.size) { "" }
+        // Lectura con paciencia: si alcanzas a la descarga, el servidor tarda en mandar lo que falta.
+        fuentes = ProgressiveMediaSource.Factory(
+            DefaultHttpDataSource.Factory().setConnectTimeoutMs(8_000).setReadTimeoutMs(60_000))
         posiciones = intent.getIntArrayExtra("posiciones") ?: IntArray(0)
         duraciones = intent.getIntArrayExtra("duraciones") ?: IntArray(0)
         actual = intent.getIntExtra("indice", 0)
@@ -61,7 +71,11 @@ class ReproductorActivity : Activity() {
 
     private fun cargar(i: Int) {
         actual = i
-        reproductor.setMediaItem(MediaItem.fromUri(api.url(medias[i])))
+        val video = fuentes.createMediaSource(MediaItem.fromUri(api.url(medias[i])))
+        reproductor.setMediaSource(
+            if (audios[i].isEmpty()) video
+            else MergingMediaSource(video, fuentes.createMediaSource(MediaItem.fromUri(api.url(audios[i]))))
+        )
         val pos = posiciones[i]
         val dur = duraciones[i]
         // Sigue donde lo dejaste, salvo que ya lo hayas terminado.
